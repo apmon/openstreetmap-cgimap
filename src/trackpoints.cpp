@@ -24,6 +24,7 @@ using std::transform;
 using boost::shared_ptr;
 using std::stringstream;
 using std::set;
+using boost::format;
 
 static void
 construct_query(const bbox & bounds, const int page, stringstream & query)
@@ -33,7 +34,6 @@ construct_query(const bbox & bounds, const int page, stringstream & query)
 	    tiles = tiles_for_area(bounds.minlat, bounds.minlon,
 				   bounds.maxlat, bounds.maxlon);
 
-	//                                stringstream query;
 	query <<
 	    "select gpx_id, trackid, to_char(timestamp,'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as timestampt, latitude, longitude from gps_points where ((";
 	unsigned int first_id = 0, last_id = 0;
@@ -73,7 +73,10 @@ static void write_trackdesc(xml_writer & writer, shared_ptr < gpxfile const >gf)
 	writer.text(gf->file_description);
 	writer.end();
 	writer.start("url");
-	writer.text("http://api.openstreetmap.org/trace/1234/view");
+	std::ostringstream buffer;
+	/* TODO: The domain part of the url should not be hardcoded */
+	buffer << "http://api.openstreetmap.org/trace/" << gf->file_id << "/view";
+	writer.text(buffer.str());
 	writer.end();
 }
 
@@ -91,7 +94,7 @@ write_trackpoints(pqxx::work & w,
 	logger::message(query.str());
 	pqxx::result points = w.exec(query);
 
-	logger::message("Got  gps_points, streaming result");
+	logger::message("Got gps points, streaming result");
 
 	try {
 		writer.start("gpx");
@@ -101,6 +104,19 @@ write_trackpoints(pqxx::work & w,
 		long int cur_gpx_id = -1;
 		long int cur_track_id = -1;
 		bool include_timestamps = false;
+		bool is_trackable = false;
+		bool not_in_track = true;
+		int no_points = 0; /* Overall number of points in the response */
+		int no_private = 0; /* Number of points not part of (available) tracks */
+
+		/* Cache all gps points that are not trackable in an array so that they can then be written
+         * together in one single "anonymous track". Allocating static arrays is a little wasteful,
+		 * but as at this point we don't know the true number of private points yet, just allocate the
+		 * maximum possible number. At a page size of 50000 points, this is "only" 400 kb which should still
+		 * be acceptable
+		 */
+		int privatelat[TRACKPOINTS_PAGE];
+		int privatelon[TRACKPOINTS_PAGE];
 
 		shared_ptr < gpxfile const >gf;
 		for (pqxx::result::const_iterator itr = points.begin();
@@ -109,27 +125,43 @@ write_trackpoints(pqxx::work & w,
 			int lon = itr["longitude"].as < int >();
 			long int gpx_id = itr["gpx_id"].as < long int >();
 			int track_id = itr["trackid"].as < long int >();
+			no_points++;
 
 			if (cur_gpx_id != gpx_id) {
 				gf = gpxfile_cache.get(gpx_id);
 				include_timestamps = gf->trackable;
-				if (cur_gpx_id != -1) {
+				is_trackable = gf->trackable;
+				//logger::message(format("Starting new track %1% which is %2% (%3%, %4%)") % gf->file_id % gf->visibility % gf->trackable % gf->identifiable);
+
+				/* if at least one track has been written already, close the old one before opening a new one. */
+				if (!not_in_track) {
 					writer.end();	//track segment
 					writer.end();	//track
+					not_in_track = true;
 				}
-				writer.start("trk");
-				write_trackdesc(writer, gf);
+				if (is_trackable) {
+					writer.start("trk");
+					write_trackdesc(writer, gf);
+					not_in_track = false;
+				}
 				cur_gpx_id = gpx_id;
 				cur_track_id = -1;
 			}
 
+			if (!is_trackable) {
+				/* store the point for later to be included in a single "anonymous" track
+				 * to give away less information, as it is no longer ordered between tracks of know properties
+				 */
+				privatelat[no_private] = lat;
+				privatelon[no_private++] = lon;
+				continue;
+			}
+
 			if (cur_track_id != track_id) {
-				if ((cur_track_id != -1) && gf->trackable) {
-					writer.end();
+				if (cur_track_id != -1) {
+					writer.end(); // end tracksegment
 				}
-				if (gf->trackable || (cur_track_id == -1)) {
-					writer.start("trkseg");
-				}
+				writer.start("trkseg");
 				cur_track_id = track_id;
 			}
 
@@ -141,12 +173,33 @@ write_trackpoints(pqxx::work & w,
 				writer.text(itr["timestampt"].c_str());
 				writer.end();
 			}
+			writer.end(); //end trkpt
+		}
+		if (!not_in_track) {
+			writer.end();	//track segment
+			writer.end();	//track
+			not_in_track = true;
+		}
+
+		/* After writing all the other points, now write the private points
+		 * in a single anonymous track */ 
+		if (no_private > 0) {
+			writer.start("trk");
+			writer.start("trkseg");
+			not_in_track = false;
+		}
+		for (int i = 0; i < no_private; i++) {
+			writer.start("trkpt");
+			writer.attribute("lat", double (privatelat[i]) / double (SCALE));
+			writer.attribute("lon", double (privatelon[i]) / double (SCALE));
 			writer.end();
 		}
-		if (cur_gpx_id != -1) {
+		if (!not_in_track) {
 			writer.end();	//track segment
 			writer.end();	//track
 		}
+		
+		logger::message(format("Returned %1% points of which %2% where private") % no_points % no_private) ;
 
 	}
 	catch(const std::exception & e) {

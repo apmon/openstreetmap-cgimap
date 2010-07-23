@@ -274,7 +274,6 @@ get_options(int argc, char **argv, po::variables_map &options) {
     ("charset", po::value<string>()->default_value("utf8"), "database character set")
     ("port", po::value<int>(), "port number to use")
     ("daemon", "run as a daemon")
-	("trackpoints", "switch from map call to trackpoints call. (!!!needs to be done from the request!!!)")
     ("instances", po::value<int>()->default_value(5), "number of daemon instances to run")
     ("pidfile", po::value<string>(), "file to write pid to")
     ("logfile", po::value<string>(), "file to write log messages to");
@@ -418,10 +417,6 @@ process_requests(int socket, const po::variables_map &options) {
   if (options.count("logfile")) {
     logger::initialise(options["logfile"].as<string>());
   }
-  bool mapcall = true;
-  if (options.count("trackpoints")) {
-    mapcall = false;
-  }
 
   // initialise FCGI
   if (FCGX_Init() != 0) {
@@ -446,11 +441,6 @@ process_requests(int socket, const po::variables_map &options) {
   cache<long int, gpxfile> gpxfile_cache(boost::bind(fetch_gpxfile, boost::ref(cache_x), _1), CACHE_SIZE);
 
   logger::message("Initialised");
-  if (mapcall) {
-	logger::message("Accepting map calls");
-  } else {
-	logger::message("Accepting trackpoints calls");
-  }
 
   // enter the main loop
   while (!terminate_requested) {
@@ -466,19 +456,21 @@ process_requests(int socket, const po::variables_map &options) {
     // get the next request
     if (FCGX_Accept_r(&request) >= 0)
     {
+      const char *request_uri = FCGX_GetParam("REQUEST_URI", request.envp);
+      logger::message(format("Received request %1% by %2% with %3%") % request_uri % 
+					  FCGX_GetParam("REMOTE_ADDR", request.envp) % FCGX_GetParam("HTTP_USER_AGENT", request.envp));
       try {
         // separate transaction for the request
 		pqxx::work x(*con);
         // read all the input data..?
 
-        /* We need a proper equivalent for the routes.rb file here.
-         * Currently it is hardcoded if cgimap replies to the map call, or the trackpoints call
-         * and thus needs a separate set of daemons
-         */
-		if (mapcall) {
+        /* Choose which function to process based on the request_uri  */
+		if (strstr(request_uri,"/api/0.6/map?") == request_uri) {
 		  process_mapcall(request, x, changeset_cache);
-		} else {
+		} else if (strstr(request_uri,"/api/0.6/trackpoints?") == request_uri) {
 		  process_trackpoints(request, x, gpxfile_cache);
+		} else {
+			throw http::bad_request("You requested a function not supported by cgimap");
 		}
       } catch (const http::exception &e) {
         // errors here occur before we've started writing the response
@@ -491,7 +483,8 @@ process_requests(int socket, const po::variables_map &options) {
         throw;
       }
     } else if (errno != EINTR) {
-      throw runtime_error("error accepting request.");
+		logger::message(format("error accepting request: %1%") % strerror(errno));
+		throw runtime_error("error accepting request.");
     }
   }
 
