@@ -10,6 +10,7 @@
 #include <boost/program_options.hpp>
 #include <boost/foreach.hpp>
 #include <boost/format.hpp>
+#include <boost/lexical_cast.hpp>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -29,6 +30,8 @@
 #include "http.hpp"
 #include "logger.hpp"
 
+#include "trackpoints.hpp"
+
 using std::runtime_error;
 using std::vector;
 using std::string;
@@ -37,6 +40,8 @@ using std::ostringstream;
 using std::auto_ptr;
 using boost::shared_ptr;
 using boost::format;
+using boost::lexical_cast;
+using boost::bad_lexical_cast;
 
 namespace pt = boost::posix_time;
 namespace po = boost::program_options;
@@ -131,7 +136,7 @@ get_encoding(FCGX_Request &req) {
  * throwing an error if there was no valid bounding box.
  */
 bbox
-validate_request(FCGX_Request &request) {
+validate_request(FCGX_Request &request, int * page) {
   // check that the REQUEST_METHOD is a GET
   if (fcgi_get_env(request, "REQUEST_METHOD") != "GET") 
     throw http::method_not_allowed("Only the GET method is supported for "
@@ -164,6 +169,19 @@ validate_request(FCGX_Request &request) {
     ostr << "The maximum bbox size is " << MAX_AREA << ", and your request "
       "was too large. Either request a smaller area, or use planet.osm";
     throw http::bad_request(ostr.str());
+  }
+
+  if (page != NULL) {
+    (*page) = 0;
+    try {
+      map<string, string>::const_iterator itr2 = params.find("page");
+      if (!(itr2 == params.end())){
+	    (*page) = lexical_cast<int>(itr2->second);
+      }
+    } catch (const bad_lexical_cast &) {
+      throw http::bad_request("The page parameter must be numerical");
+    }
+    if ((*page) < 0) throw http::bad_request("The page parameter must be a positive number");
   }
 
   return bounds;
@@ -256,6 +274,7 @@ get_options(int argc, char **argv, po::variables_map &options) {
     ("charset", po::value<string>()->default_value("utf8"), "database character set")
     ("port", po::value<int>(), "port number to use")
     ("daemon", "run as a daemon")
+	("trackpoints", "switch from map call to trackpoints call. (!!!needs to be done from the request!!!)")
     ("instances", po::value<int>()->default_value(5), "number of daemon instances to run")
     ("pidfile", po::value<string>(), "file to write pid to")
     ("logfile", po::value<string>(), "file to write log messages to");
@@ -278,65 +297,14 @@ get_options(int argc, char **argv, po::variables_map &options) {
   }
 }
 
-/**
- * loop processing fasctgi requests until are asked to stop by
- * somebody sending us a TERM signal.
- */
-static void
-process_requests(int socket, const po::variables_map &options) {
-  // open any log file
-  if (options.count("logfile")) {
-    logger::initialise(options["logfile"].as<string>());
-  }
-
-  // initialise FCGI
-  if (FCGX_Init() != 0) {
-    throw runtime_error("Couldn't initialise FCGX library.");
-  }
-
-  // get the parameters for the connection from the environment
-  // and connect to the database, throws exceptions if it fails.
-  auto_ptr<pqxx::connection> con = connect_db(options);
-  auto_ptr<pqxx::connection> cache_con = connect_db(options);
-
-  // create the request object for fcgi calls
-  FCGX_Request request;
-  if (FCGX_InitRequest(&request, socket, FCGI_FAIL_ACCEPT_ON_INTR) != 0) {
-    throw runtime_error("Couldn't initialise FCGX request structure.");
-  }
-
-  // start a transaction using a second connection just for looking up 
-  // users/changesets for the cache.
-  pqxx::nontransaction cache_x(*cache_con, "changeset_cache");
-  cache<long int, changeset> changeset_cache(boost::bind(fetch_changeset, boost::ref(cache_x), _1), CACHE_SIZE);
-
-  logger::message("Initialised");
-
-  // enter the main loop
-  while (!terminate_requested) {
-    // process any reload request
-    if (reload_requested) {
-      if (options.count("logfile")) {
-	logger::initialise(options["logfile"].as<string>());
-      }
-
-      reload_requested = false;
-    }
-
-    // get the next request
-    if (FCGX_Accept_r(&request) >= 0)
-    {
-      try {
-	// read all the input data..?
-
-	// validate the input
-	bbox bounds = validate_request(request);
+static void process_mapcall(FCGX_Request &request, pqxx::work &x , cache<long int, changeset> changeset_cache) {
+		// validate the input
+	bbox bounds = validate_request(request, NULL);
 
 	pt::ptime start_time(pt::second_clock::local_time());
 	logger::message(format("Started request for %1%,%2%,%3%,%4%") % bounds.minlat % bounds.minlon % bounds.maxlat % bounds.maxlon);
 
-	// separate transaction for the request
-	pqxx::work x(*con);
+	
 
 	// create temporary tables of nodes, ways and relations which
 	// are in or used by elements in the bbox
@@ -390,17 +358,137 @@ process_requests(int socket, const po::variables_map &options) {
 
 	pt::ptime end_time(pt::second_clock::local_time());
 	logger::message(format("Completed request in %1%") % (end_time - start_time));
-      } catch (const http::exception &e) {
-	// errors here occur before we've started writing the response
-	// so we can send something helpful back to the client.
-	respond_error(e, request);
+}
 
-      } catch (const std::exception &e) {
-	// catch an error here to provide feedback to the user
-	respond_error(http::server_error(e.what()), request);
+static void process_trackpoints(FCGX_Request &request, pqxx::work &x, cache<long int, gpxfile> gpxfile_cache) {
+		// validate the input
+	int page;
+	bbox bounds = validate_request(request, &page);
+
+
+	pt::ptime start_time(pt::second_clock::local_time());
+	logger::message(format("Started trackpoints request for %1%,%2%,%3%,%4% at page %5%") % bounds.minlat % bounds.minlon % bounds.maxlat % bounds.maxlon % page);
+
+
+	// get encoding to use
+	shared_ptr<http::encoding> encoding = get_encoding(request);
+
+	// write the response header
+	FCGX_FPrintF(request.out,
+		     "Status: 200 OK\r\n"
+		     "Content-Type: text/xml; charset=utf-8\r\n"
+		     "Content-Disposition: attachment; filename=\"tracks.gpx\"\r\n"
+		     "Content-Encoding: %s\r\n"
+		     "Cache-Control: private, max-age=0, must-revalidate\r\n"
+		     "\r\n", encoding->name().c_str());
 	
-	// re-throw the exception for higher-level handling
-	throw;
+	// create the XML writer with the FCGI streams as output
+	shared_ptr<xml_writer::output_buffer> out =
+	  shared_ptr<fcgi_output_buffer>(new fcgi_output_buffer(request));
+	out = encoding->output_buffer(out);
+	xml_writer writer(out, true);
+	
+	try {
+	  // call to write the trackpoints call
+		write_trackpoints(x,writer,bounds, page, gpxfile_cache);
+
+	} catch (const xml_writer::write_error &e) {
+	  // don't do anything - just go on to the next request.
+	  
+	} catch (const std::exception &e) {
+	  // errors here are unrecoverable (fatal to the request but maybe
+	  // not fatal to the process) since we already started writing to
+	  // the client.
+	  writer.start("error");
+	  writer.text(e.what());
+	  writer.end();
+	}
+
+	pt::ptime end_time(pt::second_clock::local_time());
+	logger::message(format("Completed request in %1%") % (end_time - start_time));
+}
+
+/**
+ * loop processing fasctgi requests until are asked to stop by
+ * somebody sending us a TERM signal.
+ */
+static void
+process_requests(int socket, const po::variables_map &options) {
+  // open any log file
+  if (options.count("logfile")) {
+    logger::initialise(options["logfile"].as<string>());
+  }
+  bool mapcall = true;
+  if (options.count("trackpoints")) {
+    mapcall = false;
+  }
+
+  // initialise FCGI
+  if (FCGX_Init() != 0) {
+    throw runtime_error("Couldn't initialise FCGX library.");
+  }
+
+  // get the parameters for the connection from the environment
+  // and connect to the database, throws exceptions if it fails.
+  auto_ptr<pqxx::connection> con = connect_db(options);
+  auto_ptr<pqxx::connection> cache_con = connect_db(options);
+
+  // create the request object for fcgi calls
+  FCGX_Request request;
+  if (FCGX_InitRequest(&request, socket, FCGI_FAIL_ACCEPT_ON_INTR) != 0) {
+    throw runtime_error("Couldn't initialise FCGX request structure.");
+  }
+
+  // start a transaction using a second connection just for looking up 
+  // users/changesets for the cache.
+  pqxx::nontransaction cache_x(*cache_con, "changeset_cache");
+  cache<long int, changeset> changeset_cache(boost::bind(fetch_changeset, boost::ref(cache_x), _1), CACHE_SIZE);
+  cache<long int, gpxfile> gpxfile_cache(boost::bind(fetch_gpxfile, boost::ref(cache_x), _1), CACHE_SIZE);
+
+  logger::message("Initialised");
+  if (mapcall) {
+	logger::message("Accepting map calls");
+  } else {
+	logger::message("Accepting trackpoints calls");
+  }
+
+  // enter the main loop
+  while (!terminate_requested) {
+    // process any reload request
+    if (reload_requested) {
+      if (options.count("logfile")) {
+	logger::initialise(options["logfile"].as<string>());
+      }
+
+      reload_requested = false;
+    }
+
+    // get the next request
+    if (FCGX_Accept_r(&request) >= 0)
+    {
+      try {
+        // separate transaction for the request
+		pqxx::work x(*con);
+        // read all the input data..?
+
+        /* We need a proper equivalent for the routes.rb file here.
+         * Currently it is hardcoded if cgimap replies to the map call, or the trackpoints call
+         * and thus needs a separate set of daemons
+         */
+		if (mapcall) {
+		  process_mapcall(request, x, changeset_cache);
+		} else {
+		  process_trackpoints(request, x, gpxfile_cache);
+		}
+      } catch (const http::exception &e) {
+        // errors here occur before we've started writing the response
+        // so we can send something helpful back to the client.
+        respond_error(e, request);
+      } catch (const std::exception &e) {
+        // catch an error here to provide feedback to the user
+        respond_error(http::server_error(e.what()), request);
+        // re-throw the exception for higher-level handling
+        throw;
       }
     } else if (errno != EINTR) {
       throw runtime_error("error accepting request.");

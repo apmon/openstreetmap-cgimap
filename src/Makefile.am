@@ -3,7 +3,7 @@ AM_LDFLAGS=@BOOST_LDFLAGS@
 AM_CPPFLAGS=-I../include @FCGI_CFLAGS@ @LIBPQXX_CFLAGS@ @LIBXML_CFLAGS@ @BOOST_CPPFLAGS@
 
 bin_PROGRAMS=../map
-___map_SOURCES=bbox.cpp http.cpp main.cpp map.cpp quad_tile.cpp \
+___map_SOURCES=bbox.cpp http.cpp main.cpp map.cpp trackpoints.cpp quad_tile.cpp \
 	split_tags.cpp temp_tables.cpp writer.cpp changeset.cpp \
-	logger.cpp zlib.cpp
+	logger.cpp zlib.cpp gpxfile.cpp
 
