@@ -92,6 +92,9 @@ namespace http {
 
   bad_request::bad_request(const string &message)
     : exception(400, "Bad Request", message) {}
+
+  not_found::not_found(const string &message)
+    : exception(404, "Not Found", message) {}
   
   method_not_allowed::method_not_allowed(const string &message)
     : exception(405, "Method Not Allowed", message) {}  

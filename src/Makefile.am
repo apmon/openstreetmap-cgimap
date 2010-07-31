@@ -4,6 +4,6 @@ AM_CPPFLAGS=-I../include @FCGI_CFLAGS@ @LIBPQXX_CFLAGS@ @LIBXML_CFLAGS@ @BOOST_C
 
 bin_PROGRAMS=../map
 ___map_SOURCES=bbox.cpp http.cpp main.cpp map.cpp trackpoints.cpp quad_tile.cpp \
-	split_tags.cpp temp_tables.cpp writer.cpp changeset.cpp \
+	split_tags.cpp temp_tables.cpp temp_tables_by_rel.cpp writer.cpp changeset.cpp \
 	logger.cpp zlib.cpp gpxfile.cpp
 

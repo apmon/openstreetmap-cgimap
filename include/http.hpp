@@ -69,6 +69,15 @@ namespace http {
   };
 
   /**
+   * The client's address was not found.
+   */
+  class not_found
+    : public exception {
+  public:
+    not_found(const std::string &message);
+  };
+
+  /**
    * The client has attempted to use an HTTP method which is not 
    * supported on the receiving URI. This is a very specific error
    * and shouldn't be used except in this context.

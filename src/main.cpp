@@ -37,6 +37,7 @@ using std::vector;
 using std::string;
 using std::map;
 using std::ostringstream;
+using std::stringstream; 
 using std::auto_ptr;
 using boost::shared_ptr;
 using boost::format;
@@ -359,6 +360,72 @@ static void process_mapcall(FCGX_Request &request, pqxx::work &x , cache<long in
 	logger::message(format("Completed request in %1%") % (end_time - start_time));
 }
 
+static void process_relationfull(FCGX_Request &request, const int rid, pqxx::work &x , cache<long int, changeset> changeset_cache) {
+
+	bbox bounds;	
+
+	pt::ptime start_time(pt::second_clock::local_time());
+	logger::message(format("Started relation full request for relation %1%") % rid);
+
+	// check if the relation exists and is visible
+	stringstream query; 
+	query << "select count(*) from current_relations WHERE id = " 
+		  << rid << " AND visible = true";
+
+	pqxx::result res = x.exec(query);
+	int num_rels = res[0][0].as<int>();
+	if (num_rels < 1) {
+		//TODO: should distinguish between 404 not_found and 410 gone
+	  throw http::not_found("Your relation doesn't exist");
+	}
+	
+
+	// create temporary tables of nodes, ways and relations which
+	// are in or used by this relation
+	tmp_nodes tn(x, rid);
+	tmp_ways tw(x, rid);
+	tmp_relations tr(x, rid);
+
+	// get encoding to use
+	shared_ptr<http::encoding> encoding = get_encoding(request);
+
+	// write the response header
+	FCGX_FPrintF(request.out,
+		     "Status: 200 OK\r\n"
+		     "Content-Type: text/xml; charset=utf-8\r\n"
+		     "Content-Disposition: attachment; filename=\"map.osm\"\r\n"
+		     "Content-Encoding: %s\r\n"
+		     "Cache-Control: private, max-age=0, must-revalidate\r\n"
+		     "\r\n", encoding->name().c_str());
+	
+	// create the XML writer with the FCGI streams as output
+	shared_ptr<xml_writer::output_buffer> out =
+	  shared_ptr<fcgi_output_buffer>(new fcgi_output_buffer(request));
+	out = encoding->output_buffer(out);
+	xml_writer writer(out, true);
+	
+	try {
+	  // We can reuse the map-call writer, as the output is the same, just with a different
+	  // set of temp tables.
+	  // TODO: need to deal with the bounds variable, as there is no appropriate bounds here
+	  write_map(x, writer, bounds, changeset_cache);
+
+	} catch (const xml_writer::write_error &e) {
+	  // don't do anything - just go on to the next request.
+	  
+	} catch (const std::exception &e) {
+	  // errors here are unrecoverable (fatal to the request but maybe
+	  // not fatal to the process) since we already started writing to
+	  // the client.
+	  writer.start("error");
+	  writer.text(e.what());
+	  writer.end();
+	}
+
+	pt::ptime end_time(pt::second_clock::local_time());
+	logger::message(format("Completed request in %1%") % (end_time - start_time));
+}
+
 static void process_trackpoints(FCGX_Request &request, pqxx::work &x, cache<long int, gpxfile> gpxfile_cache) {
 		// validate the input
 	int page;
@@ -463,12 +530,15 @@ process_requests(int socket, const po::variables_map &options) {
         // separate transaction for the request
 		pqxx::work x(*con);
         // read all the input data..?
+		int id = -1;
 
         /* Choose which function to process based on the request_uri  */
 		if (strstr(request_uri,"/api/0.6/map?") == request_uri) {
 		  process_mapcall(request, x, changeset_cache);
 		} else if (strstr(request_uri,"/api/0.6/trackpoints?") == request_uri) {
 		  process_trackpoints(request, x, gpxfile_cache);
+		} else if (sscanf(request_uri,"/api/0.6/relation/%i/full", &id) > 0) {
+			process_relationfull(request, id, x, changeset_cache);
 		} else {
 			throw http::bad_request("You requested a function not supported by cgimap");
 		}

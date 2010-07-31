@@ -9,6 +9,7 @@
 class tmp_nodes {
 public:
   tmp_nodes(pqxx::work &work, const bbox &bounds);
+  tmp_nodes(pqxx::work &work, const int rid);
 private:
   pqxx::work &work;
 };
@@ -16,6 +17,7 @@ private:
 class tmp_ways {
 public:
   tmp_ways(pqxx::work &work);
+  tmp_ways(pqxx::work &work, const int rid);
 private:
   pqxx::work &work;
 };
@@ -23,6 +25,8 @@ private:
 class tmp_relations {
 public:
   tmp_relations(pqxx::work &work);
+  tmp_relations(pqxx::work &work, const int rid);
+
 private:
   pqxx::work &work;
 };
